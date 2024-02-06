@@ -1,80 +1,75 @@
-import streamlit as st
 from dotenv import load_dotenv
-from PyPDF2 import PdfReader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.embeddings import OpenAIEmbeddings, HuggingFaceInstructEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from langchain.chat_models import ChatOpenAI
-from htmlTemplate import css, bot_template, user_template
+import os
+from pinecone import Pinecone
+load_dotenv()
+import streamlit as st
+from llama_index.vector_stores import PineconeVectorStore
+from llama_index import VectorStoreIndex
+from llama_index.callbacks import LlamaDebugHandler, CallbackManager
+from llama_index import ServiceContext
+from llama_index.postprocessor import SentenceEmbeddingOptimizer
 
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
-
-def get_text_chunks(text):
-    text_splitter = CharacterTextSplitter(separator ="\n",chunk_size=1000,chunk_overlap=200,length_function=len)
-    chunks = text_splitter.split_text(text)
-    return chunks
-
-def get_vectorstore(text_chunks):
-    model_name = 'hkunlp/instructor-xl'
-    embeddings= HuggingFaceInstructEmbeddings(model_name=model_name)
-    vectorstore= FAISS.from_texts(texts=text_chunks,embedding=embeddings)
-    return vectorstore
-
-def get_conversation_chain(vectorstore):
-    llm= ChatOpenAI()
-    memory = ConversationBufferMemory(memory_key = 'chat_history',return_messages=True)
-    conversation_chain = ConversationalRetrievalChain.from_llm(llm=llm,retriever=vectorstore.as_retriever(),memory=memory)
-    return conversation_chain
-
-def handle_userinput(user_question):
-    response = st.session_state.conversation({'question':user_question})
-    st.write(response)
-
-def main():
-    load_dotenv()
-    st.set_page_config(page_title="Chat with multiple PDFs",page_icon=":books:")
-
-    st.write(css,unsafe_allow_html=True)
-
-    if "conversation" not in st.session_state:
-        st.session_state.conversation = None
-
-    st.header("Char with multiples PDFs :books:")
-    user_question=st.text_input("Ask a question about documents:")
-
-    if user_question:
-        handle_userinput(user_question)
-
-    st.write(user_template.replace("{{MSG}}","Hello Robot"),unsafe_allow_html=True)
-    st.write(bot_template.replace("{{MSG}}","Hello Human"),unsafe_allow_html=True)
-
-    with st.sidebar:
-        st.subheader("your documents")
-        pdf_docs=st.file_uploader("upload your PDFs here and click on 'process'", accept_multiple_files=True)
-        if st.button("process"):
-            with st.spinner("Processing"):
-                
-              #get pdf text
-              raw_text = get_pdf_text(pdf_docs)
-              
-              #get text chunks
-              text_chunks = get_text_chunks(raw_text)
-
-              #create vector store
-              vectorstore = get_vectorstore(text_chunks)
-
-              #create conversation chain
-              st.session_state.conversation = get_conversation_chain(vectorstore)
+llama_debug = LlamaDebugHandler(print_trace_on_end=True)
+callback_manager = CallbackManager(handlers=[llama_debug])
+service_context = ServiceContext.from_defaults(callback_manager=callback_manager)
 
 
+@st.cache_resource(show_spinner=False)
+def get_index() -> VectorStoreIndex:
+    pine = Pinecone(
+        api_key=os.environ["PINECONE_API_KEY"],
+        environment=os.environ["PINECONE_ENVIRONMENT"],
+    )
+    index_name = "langchain"
+    pinecone_index = pine.Index(index_name)
+    vector_store = PineconeVectorStore(pinecone_index=pinecone_index)
 
-if __name__ =='__main__':
-    main()
+    return VectorStoreIndex.from_vector_store(
+        vector_store=vector_store, service_context=service_context
+    )
+
+
+index = get_index()
+
+if "chat_engine" not in st.session_state.keys():
+    postprocessor = SentenceEmbeddingOptimizer(
+        embed_model=service_context.embed_model,
+        percentile_cutoff=0.5,
+        threshold_cutoff=0.7,
+    )
+    st.session_state.chat_engine = index.as_chat_engine(
+        chat_mode="context", verbose=True
+    )
+
+st.set_page_config(
+    page_title="Chat With LlamaIndex docs ,powered by LlamaIndex",
+    layout="centered",
+    initial_sidebar_state="auto",
+    menu_items=None,
+)
+st.title("Chat with LlamaIndex docs")
+if "messages" not in st.session_state.keys():
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": "Ask me a question about Llama index open source python library?",
+        }
+    ]
+if prompt := st.chat_input("Your question"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+
+if st.session_state.messages[-1]["role"] != "assistant":
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking...."):
+            response = st.session_state.chat_engine.chat(message=prompt)
+            st.write(response.response)
+            nodes = [node for node in response.source_nodes]
+            for col, node, i in zip(st.columns(len(nodes)), nodes, range(len(nodes))):
+                with col:
+                    st.header(f"Source Node  {i+1}: score = {node.score} ")
+                    st.write(node.text)
+                message = {"role": "assistant", "content": response.response}
+            st.session_state.messages.append(message)
