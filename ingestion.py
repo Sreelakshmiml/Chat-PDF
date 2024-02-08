@@ -31,7 +31,7 @@ if __name__ == "__main__":
         llm=llm, embed_model=embed_model, node_parser=node_parser
     )
 
-    index_name = "langchain"
+    index_name = "llamaindex-documentation-helper"
     pinecone_index = pc.Index(index_name)
     vectorstore = PineconeVectorStore(pinecone_index=pinecone_index)
     storage_context = StorageContext.from_defaults(vector_store=vectorstore)
